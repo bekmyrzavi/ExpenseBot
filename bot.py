@@ -253,12 +253,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Бот учёта расходов активен!*\n\n"
         "Отправляй:\n• Текст: `Обед 850`\n• Фото чека 🧾\n\n"
-        "/otchet — отчёт за месяц
-/otchet segodnya
-/otchet nedelya
-/otchet vse
-/udalit — удалить последнюю запись
-/pomosh",
+        "/otchet - otchet za mesyac\n/otchet segodnya\n/otchet nedelya\n/otchet vse\n/udalit - udalit poslednyuyu zapis\n/pomosh",
         parse_mode="Markdown"
     )
 
