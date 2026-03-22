@@ -253,7 +253,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Бот учёта расходов активен!*\n\n"
         "Отправляй:\n• Текст: `Обед 850`\n• Фото чека 🧾\n\n"
-        "/отчет — отчёт за месяц\n/отчет сегодня\n/отчет неделя\n/отчет все\n/удалить — удалить последнюю запись\n/помощь",
+        "/otchet — отчёт за месяц
+/otchet segodnya
+/otchet nedelya
+/otchet vse
+/udalit — удалить последнюю запись
+/pomosh",
         parse_mode="Markdown"
     )
 
@@ -263,9 +268,9 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     period = "month"
     if args:
         a = args[0].lower()
-        if a in ["сегодня", "today"]: period = "today"
-        elif a in ["неделя", "week"]: period = "week"
-        elif a in ["всё", "все", "all", "всего"]: period = "all"
+        if a in ["сегодня", "today", "segodnya"]: period = "today"
+        elif a in ["неделя", "week", "nedelya"]: period = "week"
+        elif a in ["всё", "все", "all", "всего", "vse"]: period = "all"
     await update.message.reply_text("⏳ Формирую отчёт...")
     await update.message.reply_text(get_report(period), parse_mode="Markdown")
 
@@ -282,11 +287,11 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Команды бота:*\n\n"
-        "`/отчет` — текущий месяц\n"
-        "`/отчет сегодня` — за сегодня\n"
-        "`/отчет неделя` — за 7 дней\n"
-        "`/отчет все` — за всё время\n"
-        "`/удалить` — удалить мою последнюю запись\n\n"
+        "`/otchet` — текущий месяц\n"
+        "`/otchet segodnya` — за сегодня\n"
+        "`/otchet nedelya` — за 7 дней\n"
+        "`/otchet vse` — за всё время\n"
+        "`/udalit` — удалить мою последнюю запись\n\n"
         "*Добавление:* просто пиши текст или кидай фото чека.",
         parse_mode="Markdown"
     )
@@ -295,11 +300,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("отчет",   cmd_report))
+    app.add_handler(CommandHandler("otchet",   cmd_report))
     app.add_handler(CommandHandler("report",  cmd_report))
-    app.add_handler(CommandHandler("удалить", cmd_delete))
+    app.add_handler(CommandHandler("udalit", cmd_delete))
     app.add_handler(CommandHandler("delete",  cmd_delete))
-    app.add_handler(CommandHandler("помощь",  cmd_help))
+    app.add_handler(CommandHandler("pomosh",  cmd_help))
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
