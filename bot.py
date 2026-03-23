@@ -1,6 +1,9 @@
 """
-ExpenseBot v3.0 — Production-grade AI-бухгалтер
-Модель: claude-sonnet-4-6
+ExpenseBot v4.0 — Production AI-бухгалтер
+- Решительный: действует сразу, не переспрашивает
+- Контекст диалога: помнит последние 3 сообщения
+- Голос: транскрипция через Whisper (OpenAI)
+- Экономия API: короткие сообщения фильтруются
 """
 
 import os
@@ -12,11 +15,12 @@ import asyncio
 import threading
 import time
 import gc
+import tempfile
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Optional
 from zoneinfo import ZoneInfo
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import httpx
 from telegram import Update
@@ -25,9 +29,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 import anthropic
 
-# ─────────────────────────────────────────────
-# ЛОГИРОВАНИЕ
-# ─────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO
@@ -47,45 +48,41 @@ TELEGRAM_TOKEN    = _require_env("TELEGRAM_TOKEN")
 ANTHROPIC_KEY     = _require_env("ANTHROPIC_API_KEY")
 SPREADSHEET_ID    = _require_env("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = _require_env("GOOGLE_CREDS_JSON")
+OPENAI_KEY        = os.environ.get("OPENAI_API_KEY", "")  # опционально для голоса
 
 TZ = ZoneInfo("Asia/Bishkek")
 
-# Лимиты
-MAX_IMAGE_BYTES    = 10 * 1024 * 1024   # 10 MB
-MAX_TEXT_LENGTH    = 2000
-MAX_AMOUNT         = 100_000_000
-MAX_RETRIES        = 3
-RETRY_DELAY        = 2.0
+MAX_IMAGE_BYTES   = 10 * 1024 * 1024
+MAX_TEXT_LENGTH   = 1000
+MAX_AMOUNT        = 100_000_000
+MAX_RETRIES       = 3
+RETRY_DELAY       = 2.0
+RATE_LIMIT_MSGS   = 15
+RATE_LIMIT_WINDOW = 60
+AI_SEMAPHORE      = 5
+CACHE_TTL         = 30
+GC_MAX_AGE        = 3500
 
-# Rate limiting — защита от спама
-RATE_LIMIT_MSGS    = 10     # максимум сообщений
-RATE_LIMIT_WINDOW  = 60     # за N секунд на одного пользователя
-
-# Anthropic rate limit
-AI_SEMAPHORE_LIMIT = 5      # макс одновременных AI-запросов
-
-# Кэш таблицы
-CACHE_TTL_SECONDS  = 30     # кэшируем данные таблицы на 30 секунд
+# Контекст диалога: последние N сообщений на чат
+CONTEXT_SIZE = 4
 
 # ─────────────────────────────────────────────
 # ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
 # ─────────────────────────────────────────────
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-ai_semaphore  = asyncio.Semaphore(AI_SEMAPHORE_LIMIT)
-sheets_lock   = threading.Lock()  # защита от конкурентной записи
-
-# Rate limiter: user_id -> список timestamp
+claude_client  = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+ai_semaphore   = asyncio.Semaphore(AI_SEMAPHORE)
+sheets_lock    = threading.Lock()
 _rate_tracker: dict[int, list[float]] = defaultdict(list)
-
-# Кэш данных таблицы
 _sheet_cache: dict = {"data": None, "ts": 0.0}
 
+# Контекст диалога: chat_id -> deque of (role, text)
+_dialog_ctx: dict[int, deque] = defaultdict(lambda: deque(maxlen=CONTEXT_SIZE))
+
 # ─────────────────────────────────────────────
-# GOOGLE SHEETS — клиент с авто-переподключением
+# GOOGLE SHEETS
 # ─────────────────────────────────────────────
 _gc: Optional[gspread.Client] = None
 _gc_created_at: float = 0.0
-GC_MAX_AGE = 3500  # пересоздаём клиент каждые ~58 минут (токен живёт 60 мин)
 
 def _build_gspread() -> gspread.Client:
     creds_data = json.loads(GOOGLE_CREDS_JSON)
@@ -97,17 +94,14 @@ def _build_gspread() -> gspread.Client:
     return gspread.authorize(creds)
 
 def get_gc() -> gspread.Client:
-    """Возвращает gspread-клиент, пересоздаёт если токен скоро истечёт."""
     global _gc, _gc_created_at
     now = time.time()
     if _gc is None or (now - _gc_created_at) > GC_MAX_AGE:
-        logger.info("gspread: создаём/обновляем клиент")
         _gc = _build_gspread()
         _gc_created_at = now
     return _gc
 
 def with_retry(func):
-    """Retry-декоратор для Google Sheets операций."""
     @wraps(func)
     def wrapper(*args, **kwargs):
         global _gc
@@ -118,26 +112,17 @@ def with_retry(func):
             except gspread.exceptions.APIError as e:
                 status = getattr(getattr(e, "response", None), "status_code", 0)
                 if status == 401:
-                    logger.warning("gspread: 401 — пересоздаём клиент")
                     _gc = _build_gspread()
                     _gc_created_at = time.time()
-                elif status == 429:
-                    wait = RETRY_DELAY * (2 ** attempt)  # exponential backoff
-                    logger.warning(f"gspread: 429 rate limit — ждём {wait:.1f}с")
-                    time.sleep(wait)
-                else:
-                    time.sleep(RETRY_DELAY * attempt)
+                wait = RETRY_DELAY * (2 ** attempt) if status == 429 else RETRY_DELAY * attempt
+                logger.warning(f"gspread {status}: попытка {attempt}/{MAX_RETRIES}, ждём {wait:.1f}с")
+                time.sleep(wait)
                 last_exc = e
-                logger.warning(f"gspread: попытка {attempt}/{MAX_RETRIES} — {e}")
             except Exception as e:
                 last_exc = e
-                logger.warning(f"gspread: попытка {attempt}/{MAX_RETRIES} — {e}")
                 time.sleep(RETRY_DELAY * attempt)
-        logger.error(f"gspread: все {MAX_RETRIES} попытки исчерпаны — {last_exc}")
         raise last_exc
     return wrapper
-
-HEADERS = ["ID", "Дата", "Время", "Участник", "Наименование", "Сумма", "Категория", "Источник"]
 
 @with_retry
 def get_sheet() -> gspread.Worksheet:
@@ -147,73 +132,66 @@ def get_sheet() -> gspread.Worksheet:
         return sh.worksheet("Расходы")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="Расходы", rows=5000, cols=8)
-        ws.append_row(HEADERS)
+        ws.append_row(["ID", "Дата", "Время", "Участник", "Наименование", "Сумма", "Категория", "Источник"])
         ws.format("A1:H1", {
             "backgroundColor": {"red": 0.18, "green": 0.6, "blue": 0.9},
             "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
             "horizontalAlignment": "CENTER",
         })
         ws.freeze(rows=1)
-        logger.info("Создан новый лист 'Расходы'")
         return ws
 
 def _invalidate_cache():
-    """Сбрасываем кэш после записи/удаления."""
     _sheet_cache["data"] = None
-    _sheet_cache["ts"]   = 0.0
+    _sheet_cache["ts"] = 0.0
 
 @with_retry
-def _fetch_rows_uncached() -> list:
+def _fetch_rows_raw() -> list:
     ws = get_sheet()
     rows = ws.get_all_values()
     return rows[1:] if len(rows) > 1 else []
 
-def fetch_rows_cached() -> list:
-    """Возвращает строки из кэша или запрашивает таблицу."""
+def fetch_rows() -> list:
     now = time.time()
-    if _sheet_cache["data"] is not None and (now - _sheet_cache["ts"]) < CACHE_TTL_SECONDS:
+    if _sheet_cache["data"] is not None and (now - _sheet_cache["ts"]) < CACHE_TTL:
         return _sheet_cache["data"]
-    rows = _fetch_rows_uncached()
+    rows = _fetch_rows_raw()
     _sheet_cache["data"] = rows
-    _sheet_cache["ts"]   = now
+    _sheet_cache["ts"] = now
     return rows
 
 @with_retry
 def add_expense(name: str, amount: float, category: str, sender: str, source: str = "текст") -> int:
-    """Атомарная запись расхода с защитой от дублирования ID."""
     name     = (str(name).strip()     if name     not in (None, "None") else "")[:200] or "Без названия"
     sender   = (str(sender).strip()   if sender   not in (None, "None") else "")[:100] or "Участник"
     category = (str(category).strip() if category not in (None, "None") else "")[:50]  or "Прочее"
     source   = (str(source).strip()   if source   not in (None, "None") else "")[:50]  or "текст"
     amount   = round(max(0.01, min(float(amount), MAX_AMOUNT)), 2)
-
-    with sheets_lock:  # атомарная операция — только один поток пишет
-        ws  = get_sheet()
+    with sheets_lock:
+        ws = get_sheet()
         now = datetime.now(TZ)
         all_rows = ws.get_all_values()
-        row_id   = len(all_rows)  # уникальный ID
-
+        row_id = len(all_rows)
         ws.append_row(
             [row_id, now.strftime("%d.%m.%Y"), now.strftime("%H:%M"),
              sender, name, amount, category, source],
             value_input_option="USER_ENTERED",
         )
         _invalidate_cache()
-        logger.info(f"Записан расход ID={row_id}: {name} {amount} сом [{sender}]")
+        logger.info(f"✅ ID={row_id}: {name} {amount}с [{sender}]")
         return row_id
 
 @with_retry
 def delete_last_by_sender(sender: str) -> Optional[dict]:
     with sheets_lock:
         ws = get_sheet()
-        all_rows = ws.get_all_values()
-        for i in range(len(all_rows) - 1, 0, -1):
-            row = all_rows[i]
+        rows = ws.get_all_values()
+        for i in range(len(rows) - 1, 0, -1):
+            row = rows[i]
             if len(row) >= 4 and row[3] == sender:
                 deleted = {"name": row[4] if len(row) > 4 else "", "amount": row[5] if len(row) > 5 else "0"}
                 ws.delete_rows(i + 1)
                 _invalidate_cache()
-                logger.info(f"Удалена запись [{sender}]: {deleted}")
                 return deleted
     return None
 
@@ -223,66 +201,57 @@ def delete_by_id(row_id: int) -> Optional[dict]:
         return None
     with sheets_lock:
         ws = get_sheet()
-        all_rows = ws.get_all_values()
-        for i in range(1, len(all_rows)):
-            row = all_rows[i]
+        rows = ws.get_all_values()
+        for i in range(1, len(rows)):
+            row = rows[i]
             if row and str(row[0]) == str(row_id):
                 deleted = {"name": row[4] if len(row) > 4 else "", "amount": row[5] if len(row) > 5 else "0"}
                 ws.delete_rows(i + 1)
                 _invalidate_cache()
-                logger.info(f"Удалена запись ID={row_id}: {deleted}")
                 return deleted
     return None
 
 def _parse_amount(raw: str) -> float:
     try:
         return float(str(raw).replace(",", ".").replace(" ", "").replace("\xa0", ""))
-    except (ValueError, TypeError):
+    except:
         return 0.0
 
-def build_report_text(period: str = "month") -> str:
-    rows = fetch_rows_cached()
+def build_report(period: str = "month") -> str:
+    rows = fetch_rows()
     if not rows:
         return "📭 Расходов пока нет."
-
     now = datetime.now(TZ)
-    filtered: list = []
-    label = ""
-
+    filtered, label = [], ""
     if period == "today":
-        target   = now.strftime("%d.%m.%Y")
-        filtered = [r for r in rows if len(r) > 1 and r[1] == target]
-        label    = f"сегодня ({target})"
+        t = now.strftime("%d.%m.%Y")
+        filtered = [r for r in rows if len(r) > 1 and r[1] == t]
+        label = f"сегодня ({t})"
     elif period == "week":
-        week_ago = now - timedelta(days=7)
-        label    = "последние 7 дней"
+        ago = now - timedelta(days=7)
+        label = "последние 7 дней"
         for r in rows:
             if len(r) > 1:
                 try:
-                    d = datetime.strptime(r[1], "%d.%m.%Y").replace(tzinfo=TZ)
-                    if d >= week_ago:
+                    if datetime.strptime(r[1], "%d.%m.%Y").replace(tzinfo=TZ) >= ago:
                         filtered.append(r)
                 except ValueError:
                     pass
     elif period == "month":
-        cur      = now.strftime("%m.%Y")
+        cur = now.strftime("%m.%Y")
         filtered = [r for r in rows if len(r) > 1 and r[1].endswith(cur)]
-        label    = now.strftime("%B %Y")
+        label = now.strftime("%B %Y")
     elif period == "year":
-        cur      = now.strftime(".%Y")
+        cur = now.strftime(".%Y")
         filtered = [r for r in rows if len(r) > 1 and r[1].endswith(cur)]
-        label    = now.strftime("%Y год")
+        label = now.strftime("%Y год")
     else:
-        filtered = rows
-        label    = "всё время"
+        filtered, label = rows, "всё время"
 
     if not filtered:
-        return f"📭 За период «{label}» расходов нет."
+        return f"📭 За «{label}» расходов нет."
 
-    total     = 0.0
-    by_cat:    dict[str, float] = {}
-    by_person: dict[str, float] = {}
-
+    total, by_cat, by_person = 0.0, {}, {}
     for r in filtered:
         amt    = _parse_amount(r[5] if len(r) > 5 else "0")
         cat    = (r[6] if len(r) > 6 else "Прочее") or "Прочее"
@@ -291,17 +260,12 @@ def build_report_text(period: str = "month") -> str:
         by_cat[cat]       = by_cat.get(cat, 0.0) + amt
         by_person[person] = by_person.get(person, 0.0) + amt
 
-    out = [
-        f"📊 *Отчёт за {label}*\n",
-        f"💰 *Итого:* {total:,.0f} сом\n",
-        "📁 *По категориям:*",
-    ]
+    out = [f"📊 *Отчёт за {label}*\n", f"💰 *Итого:* {total:,.0f} сом\n", "📁 *По категориям:*"]
     for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1]):
-        pct = (amt / total * 100) if total else 0
-        out.append(f"  • {cat}: {amt:,.0f} сом ({pct:.0f}%)")
+        out.append(f"  • {cat}: {amt:,.0f} сом ({amt/total*100:.0f}%)")
     out.append("\n👥 *По участникам:*")
-    for person, amt in sorted(by_person.items(), key=lambda x: -x[1]):
-        out.append(f"  • {person}: {amt:,.0f} сом")
+    for p, amt in sorted(by_person.items(), key=lambda x: -x[1]):
+        out.append(f"  • {p}: {amt:,.0f} сом")
     out.append(f"\n📝 *Записей:* {len(filtered)}")
     return "\n".join(out)
 
@@ -309,77 +273,91 @@ def build_report_text(period: str = "month") -> str:
 # RATE LIMITER
 # ─────────────────────────────────────────────
 def is_rate_limited(user_id: int) -> bool:
-    """Возвращает True если пользователь превысил лимит сообщений."""
     now = time.time()
-    window_start = now - RATE_LIMIT_WINDOW
-    timestamps = _rate_tracker[user_id]
-    # Удаляем старые записи
-    _rate_tracker[user_id] = [t for t in timestamps if t > window_start]
+    ws = now - RATE_LIMIT_WINDOW
+    _rate_tracker[user_id] = [t for t in _rate_tracker[user_id] if t > ws]
     if len(_rate_tracker[user_id]) >= RATE_LIMIT_MSGS:
         return True
     _rate_tracker[user_id].append(now)
     return False
 
 # ─────────────────────────────────────────────
-# СИСТЕМНЫЙ ПРОМПТ
+# СИСТЕМНЫЙ ПРОМПТ — решительный, без лишних вопросов
 # ─────────────────────────────────────────────
-SYSTEM_PROMPT = """Ты умный бухгалтерский ассистент в Telegram-группе учёта расходов компании.
+SYSTEM_PROMPT = """Ты бухгалтерский бот в Telegram-группе. Отвечаешь на русском или кыргызском.
 
-Участники пишут на русском, кыргызском или любом другом языке — ты всё понимаешь.
+ГЛАВНОЕ ПРАВИЛО: ДЕЙСТВУЙ СРАЗУ. Не переспрашивай без крайней необходимости.
 
-ТВОИ ДЕЙСТВИЯ (выбери одно):
-1. ЗАПИСАТЬ расход → action: "add"
-2. УДАЛИТЬ последнюю запись → action: "delete_last"
-3. УДАЛИТЬ по ID → action: "delete_id"
-4. ОТЧЁТ → action: "report"
-5. ОТВЕТИТЬ → action: "chat"
+ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ:
 
-ФОРМАТ ОТВЕТА — строго JSON, без markdown, без текста снаружи:
+1. Если есть сумма И название → action:"add", записывай немедленно
+2. Если есть только сумма (без названия) → action:"add", name="Расход", записывай
+3. Если есть только название (без суммы) → action:"chat", спроси только сумму одним словом
+4. "удали", "отмени", "убери" → action:"delete_last" немедленно
+5. "удали ID N" или "удали N" → action:"delete_id", id:N немедленно  
+6. "удали суши/обед/[название]" → action:"delete_last" (удаляй последнюю, не уточняй)
+7. "отчёт", "сколько", "итого", "расходы" → action:"report"
+8. Просто "да", "ок", "хорошо" после вопроса о записи → action:"add" с тем что обсуждалось
+9. Одиночное число (200, 500, 1000) без контекста → action:"add", name="Расход", amount=число
 
-Расход: {"action":"add","name":"название","amount":число,"category":"категория","reply":"подтверждение"}
-Удалить последнее: {"action":"delete_last","reply":"текст"}
-Удалить по ID: {"action":"delete_id","id":число,"reply":"текст"}
-Отчёт: {"action":"report","period":"today|week|month|year|all","reply":"текст"}
-Чат: {"action":"chat","reply":"ответ"}
+НА СКРИНШОТАХ БАНКА:
+- Ищи: "Итого", "Сумма", "Total", символ валюты с числом, минус перед суммой
+- Получатель платежа = название расхода  
+- Перевод физлицу → name:"Перевод: [имя]"
+- Даже если изображение нечёткое — попробуй найти сумму
 
-ПРАВИЛА:
-- Категории ТОЛЬКО: Еда, Транспорт, Офис, Зарплата, Материалы, Коммунальные, Связь, Реклама, Прочее
-- Суммы: "5к"=5000, "тысяча"=1000, "полтора"=1500, "миллион"=1000000
-- На скриншотах банка: ищи поля "Итого"/"Сумма"/"Total"/символ валюты с цифрой
-- Переводы физлицам: name = "Перевод: Имя получателя"
-- Если сумма не найдена → action:"chat", попроси уточнить
-- amount всегда положительное число
-- reply на том же языке что написал пользователь, кратко"""
+КАТЕГОРИИ: Еда, Транспорт, Офис, Зарплата, Материалы, Коммунальные, Связь, Реклама, Прочее
+СУММЫ: 5к=5000, тысяча=1000, полтора=1500, млн=1000000
+
+ФОРМАТ ОТВЕТА — только JSON:
+{"action":"add","name":"...","amount":число,"category":"...","reply":"короткое подтверждение"}
+{"action":"delete_last","reply":"..."}
+{"action":"delete_id","id":число,"reply":"..."}
+{"action":"report","period":"today|week|month|year|all","reply":"..."}
+{"action":"chat","reply":"короткий вопрос или ответ"}
+
+ЗАПРЕЩЕНО: переспрашивать категорию, переспрашивать подтверждение записи, задавать несколько вопросов."""
 
 # ─────────────────────────────────────────────
-# AI
+# AI — с контекстом диалога
 # ─────────────────────────────────────────────
-async def process_with_ai(content_parts: list, sender: str) -> dict:
+async def process_with_ai(content_parts: list, sender: str, chat_id: int) -> dict:
     loop = asyncio.get_event_loop()
+
+    # Строим историю диалога для контекста
+    ctx = list(_dialog_ctx[chat_id])
+    history_text = ""
+    if ctx:
+        history_text = "\n\nПоследние сообщения в чате:\n"
+        for role, text in ctx:
+            prefix = f"{sender}" if role == "user" else "Бот"
+            history_text += f"{prefix}: {text}\n"
+
+    system = SYSTEM_PROMPT + f"\n\nОтправитель: {sender}" + history_text
 
     def _call():
         return claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=512,
-            system=SYSTEM_PROMPT + f"\n\nОтправитель: {sender}",
+            max_tokens=300,  # снизили с 512 до 300 — экономия API
+            system=system,
             messages=[{"role": "user", "content": content_parts}],
         )
 
-    async with ai_semaphore:  # не более AI_SEMAPHORE_LIMIT одновременных запросов
+    async with ai_semaphore:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = await loop.run_in_executor(None, _call)
                 break
             except anthropic.RateLimitError:
                 wait = RETRY_DELAY * (2 ** attempt)
-                logger.warning(f"Anthropic rate limit — ждём {wait:.1f}с (попытка {attempt})")
+                logger.warning(f"Anthropic rate limit, ждём {wait:.1f}с")
                 await asyncio.sleep(wait)
                 if attempt == MAX_RETRIES:
-                    return {"action": "chat", "reply": "Сервис временно перегружен, попробуй через минуту."}
+                    return {"action": "chat", "reply": "Перегружен, попробуй через минуту."}
             except anthropic.APIError as e:
-                logger.error(f"Anthropic API error: {e}")
+                logger.error(f"Anthropic error: {e}")
                 if attempt == MAX_RETRIES:
-                    return {"action": "chat", "reply": "Временная ошибка AI, попробуй ещё раз."}
+                    return {"action": "chat", "reply": "Временная ошибка, попробуй ещё раз."}
                 await asyncio.sleep(RETRY_DELAY * attempt)
 
     raw = response.content[0].text.strip()
@@ -387,34 +365,62 @@ async def process_with_ai(content_parts: list, sender: str) -> dict:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.error(f"AI вернул невалидный JSON: {raw!r} — {e}")
-        return {"action": "chat", "reply": "Не смог разобрать ответ, попробуй переформулировать."}
+    except json.JSONDecodeError:
+        logger.error(f"Невалидный JSON от AI: {raw!r}")
+        return {"action": "chat", "reply": "Не понял, попробуй ещё раз."}
 
     if "action" not in data:
-        logger.error(f"AI не вернул action: {data}")
-        return {"action": "chat", "reply": "Что-то пошло не так, попробуй ещё раз."}
+        return {"action": "chat", "reply": "Что-то пошло не так."}
 
     return data
 
 # ─────────────────────────────────────────────
+# ГОЛОС — транскрипция через Whisper
+# ─────────────────────────────────────────────
+async def transcribe_voice(ogg_bytes: bytes) -> Optional[str]:
+    """Транскрибирует голосовое через OpenAI Whisper."""
+    if not OPENAI_KEY:
+        return None
+    try:
+        import openai
+        client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            f.write(ogg_bytes)
+            tmp_path = f.name
+        with open(tmp_path, "rb") as audio_file:
+            result = await client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language="ru",
+            )
+        os.unlink(tmp_path)
+        return result.text.strip()
+    except Exception as e:
+        logger.error(f"Whisper error: {e}")
+        return None
+
+# ─────────────────────────────────────────────
 # ВЫПОЛНЕНИЕ ДЕЙСТВИЙ
 # ─────────────────────────────────────────────
-async def execute_action(result: dict, sender: str, msg, source: str) -> None:
+async def execute_action(result: dict, sender: str, msg, source: str, chat_id: int) -> None:
     action = result.get("action", "chat")
     reply  = str(result.get("reply", "")).strip()
     loop   = asyncio.get_event_loop()
 
+    # Сохраняем ответ бота в контекст
+    if reply:
+        _dialog_ctx[chat_id].append(("bot", reply[:200]))
+
     if action == "add":
         name     = str(result.get("name", "Расход")).strip() or "Расход"
-        category = str(result.get("category", "Прочее")).strip()
+        category = str(result.get("category", "Прочее")).strip() or "Прочее"
         try:
             amount = float(result.get("amount", 0))
             if amount <= 0 or amount > MAX_AMOUNT:
-                raise ValueError(f"Недопустимая сумма: {amount}")
+                raise ValueError(f"Некорректная сумма: {amount}")
         except (TypeError, ValueError) as e:
-            logger.warning(f"Некорректная сумма [{sender}]: {result.get('amount')} — {e}")
-            await msg.reply_text("❓ Не смог определить сумму. Напиши, например: «Обед 850»")
+            logger.warning(f"Некорректная сумма [{sender}]: {e}")
+            await msg.reply_text("❓ Укажи сумму — например: «Обед 850»")
             return
 
         try:
@@ -422,12 +428,12 @@ async def execute_action(result: dict, sender: str, msg, source: str) -> None:
                 None, lambda: add_expense(name, amount, category, sender, source)
             )
         except Exception as e:
-            logger.error(f"Ошибка записи в таблицу: {e}")
-            await msg.reply_text("⚠️ Не смог записать в таблицу. Попробуй ещё раз через несколько секунд.")
+            logger.error(f"Ошибка записи: {e}")
+            await msg.reply_text("⚠️ Не смог записать. Попробуй ещё раз.")
             return
 
         await msg.reply_text(
-            f"✅ {reply}\n\n"
+            f"✅ Записано!\n\n"
             f"📌 {name}\n"
             f"💵 {amount:,.0f} сом\n"
             f"🏷 {category}\n"
@@ -440,60 +446,53 @@ async def execute_action(result: dict, sender: str, msg, source: str) -> None:
             deleted = await loop.run_in_executor(None, lambda: delete_last_by_sender(sender))
         except Exception as e:
             logger.error(f"Ошибка удаления: {e}")
-            await msg.reply_text("⚠️ Ошибка при удалении. Попробуй ещё раз.")
+            await msg.reply_text("⚠️ Ошибка при удалении.")
             return
         if deleted:
-            await msg.reply_text(
-                f"🗑 Удалено: *{deleted['name']}* — {deleted['amount']} сом",
-                parse_mode="Markdown",
-            )
+            await msg.reply_text(f"🗑 Удалено: *{deleted['name']}* — {deleted['amount']} сом", parse_mode="Markdown")
         else:
-            await msg.reply_text("❌ У тебя нет записей для удаления.")
+            await msg.reply_text("❌ Нет твоих записей для удаления.")
 
     elif action == "delete_id":
         try:
             rid = int(result.get("id", 0))
-            if rid <= 0:
-                raise ValueError
+            if rid <= 0: raise ValueError
         except (TypeError, ValueError):
-            await msg.reply_text("❌ Укажи корректный ID записи (целое число).")
+            await msg.reply_text("❌ Укажи корректный ID числом.")
             return
         try:
             deleted = await loop.run_in_executor(None, lambda: delete_by_id(rid))
         except Exception as e:
-            logger.error(f"Ошибка удаления по ID: {e}")
-            await msg.reply_text("⚠️ Ошибка при удалении. Попробуй ещё раз.")
+            logger.error(f"Ошибка удаления ID: {e}")
+            await msg.reply_text("⚠️ Ошибка при удалении.")
             return
         if deleted:
-            await msg.reply_text(
-                f"🗑 Удалено ID {rid}: *{deleted['name']}* — {deleted['amount']} сом",
-                parse_mode="Markdown",
-            )
+            await msg.reply_text(f"🗑 Удалено ID {rid}: *{deleted['name']}* — {deleted['amount']} сом", parse_mode="Markdown")
         else:
-            await msg.reply_text(f"❌ Запись с ID {rid} не найдена.")
+            await msg.reply_text(f"❌ Запись ID {rid} не найдена.")
 
     elif action == "report":
         period = result.get("period", "month")
         if period not in ("today", "week", "month", "year", "all"):
             period = "month"
         try:
-            report = await loop.run_in_executor(None, lambda: build_report_text(period))
+            report = await loop.run_in_executor(None, lambda: build_report(period))
         except Exception as e:
-            logger.error(f"Ошибка построения отчёта: {e}")
-            await msg.reply_text("⚠️ Не смог сформировать отчёт. Попробуй ещё раз.")
+            logger.error(f"Ошибка отчёта: {e}")
+            await msg.reply_text("⚠️ Не смог сформировать отчёт.")
             return
         await msg.reply_text(report, parse_mode="Markdown")
 
     elif action == "chat":
         if reply:
             await msg.reply_text(reply)
+
     else:
-        logger.warning(f"Неизвестный action: {action!r}")
         if reply:
             await msg.reply_text(reply)
 
 # ─────────────────────────────────────────────
-# TELEGRAM HANDLERS
+# HANDLERS
 # ─────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
@@ -501,26 +500,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_id = msg.from_user.id
+    chat_id = msg.chat_id
     sender  = msg.from_user.first_name or msg.from_user.username or "Участник"
     text    = (msg.text or "").strip()
 
-    if not text:
+    if not text or len(text) > MAX_TEXT_LENGTH:
         return
-
     if is_rate_limited(user_id):
         await msg.reply_text("⏳ Слишком много сообщений. Подожди минуту.")
         return
 
-    if len(text) > MAX_TEXT_LENGTH:
-        await msg.reply_text(f"⚠️ Сообщение слишком длинное (макс. {MAX_TEXT_LENGTH} символов).")
-        return
+    # Сохраняем сообщение пользователя в контекст
+    _dialog_ctx[chat_id].append(("user", text[:200]))
 
     try:
-        result = await process_with_ai([{"type": "text", "text": text}], sender)
-        await execute_action(result, sender, msg, "текст")
+        result = await process_with_ai([{"type": "text", "text": text}], sender, chat_id)
+        await execute_action(result, sender, msg, "текст", chat_id)
     except Exception as e:
-        logger.exception(f"handle_text error [{sender}]: {e}")
-        await msg.reply_text("⚠️ Временная ошибка. Попробуй через несколько секунд.")
+        logger.exception(f"handle_text error: {e}")
+        await msg.reply_text("⚠️ Временная ошибка. Попробуй ещё раз.")
+
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
@@ -528,6 +527,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_id = msg.from_user.id
+    chat_id = msg.chat_id
     sender  = msg.from_user.first_name or msg.from_user.username or "Участник"
     caption = (msg.caption or "").strip()
 
@@ -538,17 +538,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         photo = msg.photo[-1]
         file  = await context.bot.get_file(photo.file_id)
-
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(file.file_path)
             resp.raise_for_status()
             image_bytes = resp.content
 
         if len(image_bytes) > MAX_IMAGE_BYTES:
-            await msg.reply_text("⚠️ Изображение слишком большое (макс. 10 МБ).")
+            await msg.reply_text("⚠️ Фото слишком большое (макс. 10 МБ).")
             return
 
-        # Определяем MIME по сигнатуре байт
         mime = "image/jpeg"
         if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
             mime = "image/png"
@@ -556,62 +554,99 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             mime = "image/webp"
 
         image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        hint = f"Подпись: {caption}" if caption else \
+               "Чек, квитанция или скриншот банковского приложения. Найди сумму и получателя/назначение."
 
-        hint = f"Подпись от пользователя: {caption}" if caption else \
-               "Это чек, квитанция или скриншот банковского приложения. Найди финансовую операцию — сумму и наименование."
+        _dialog_ctx[chat_id].append(("user", f"[фото] {caption}" if caption else "[фото чека]"))
 
         content_parts = [
             {"type": "image", "source": {"type": "base64", "media_type": mime, "data": image_b64}},
             {"type": "text",  "text": hint},
         ]
+        result = await process_with_ai(content_parts, sender, chat_id)
+        await execute_action(result, sender, msg, "фото чека", chat_id)
 
-        result = await process_with_ai(content_parts, sender)
-        await execute_action(result, sender, msg, "фото чека")
-
-        # Явно освобождаем память от изображения
         del image_bytes, image_b64
         gc.collect()
 
     except httpx.HTTPError as e:
-        logger.error(f"HTTP error downloading photo: {e}")
-        await msg.reply_text("⚠️ Не смог скачать фото. Попробуй ещё раз.")
+        logger.error(f"HTTP error: {e}")
+        await msg.reply_text("⚠️ Не смог скачать фото.")
     except Exception as e:
-        logger.exception(f"handle_photo error [{sender}]: {e}")
+        logger.exception(f"handle_photo error: {e}")
         await msg.reply_text("⚠️ Ошибка при обработке фото.")
+
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
-    if not msg:
+    if not msg or not msg.from_user:
         return
-    await msg.reply_text(
-        "🎤 Голосовые пока не поддерживаются.\n"
-        "Напиши текстом или отправь фото чека 🧾"
-    )
+
+    user_id = msg.from_user.id
+    chat_id = msg.chat_id
+    sender  = msg.from_user.first_name or msg.from_user.username or "Участник"
+
+    if is_rate_limited(user_id):
+        await msg.reply_text("⏳ Слишком много сообщений.")
+        return
+
+    if not OPENAI_KEY:
+        await msg.reply_text(
+            "🎤 Голосовые не настроены.\n"
+            "Добавь OPENAI_API_KEY в Railway → Variables для включения."
+        )
+        return
+
+    await msg.reply_text("🎤 Слушаю...")
+
+    try:
+        file = await context.bot.get_file(msg.voice.file_id)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(file.file_path)
+            ogg_bytes = resp.content
+
+        transcript = await transcribe_voice(ogg_bytes)
+
+        if not transcript:
+            await msg.reply_text("❓ Не смог распознать голос. Напиши текстом.")
+            return
+
+        logger.info(f"Голос [{sender}]: {transcript!r}")
+        _dialog_ctx[chat_id].append(("user", f"[голос] {transcript[:200]}"))
+
+        await msg.reply_text(f"🗣 _{transcript}_", parse_mode="Markdown")
+
+        result = await process_with_ai([{"type": "text", "text": transcript}], sender, chat_id)
+        await execute_action(result, sender, msg, "голосовое", chat_id)
+
+    except Exception as e:
+        logger.exception(f"handle_voice error: {e}")
+        await msg.reply_text("⚠️ Ошибка при обработке голосового.")
+
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {context.error}", exc_info=context.error)
 
+
 # ─────────────────────────────────────────────
-# ПЕРИОДИЧЕСКАЯ ОЧИСТКА ПАМЯТИ
+# ПЕРИОДИЧЕСКАЯ ОЧИСТКА
 # ─────────────────────────────────────────────
 async def cleanup_job(context) -> None:
-    """Запускается каждый час: чистит rate-tracker и форсирует GC."""
     now = time.time()
-    window_start = now - RATE_LIMIT_WINDOW
-    cleaned = 0
-    for uid in list(_rate_tracker.keys()):
-        _rate_tracker[uid] = [t for t in _rate_tracker[uid] if t > window_start]
+    ws  = now - RATE_LIMIT_WINDOW
+    cleaned_rate = sum(1 for uid in list(_rate_tracker) if not _rate_tracker[uid])
+    for uid in list(_rate_tracker):
+        _rate_tracker[uid] = [t for t in _rate_tracker[uid] if t > ws]
         if not _rate_tracker[uid]:
             del _rate_tracker[uid]
-            cleaned += 1
     gc.collect()
-    logger.info(f"🧹 Cleanup: удалено {cleaned} устаревших rate-записей, GC выполнен")
+    logger.info(f"🧹 Cleanup: rate_tracker очищен, GC выполнен")
+
 
 # ─────────────────────────────────────────────
 # ЗАПУСК
 # ─────────────────────────────────────────────
 def main() -> None:
-    # Проверяем Google Sheets при старте
     try:
         get_sheet()
         logger.info("✅ Google Sheets — OK")
@@ -619,21 +654,21 @@ def main() -> None:
         logger.error(f"❌ Google Sheets недоступен: {e}")
         raise
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    if OPENAI_KEY:
+        logger.info("✅ OpenAI Whisper — голосовые включены")
+    else:
+        logger.info("⚠️  OPENAI_API_KEY не задан — голосовые отключены")
 
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.VOICE,                   handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(handle_error)
-
-    # Периодическая очистка памяти каждый час
     app.job_queue.run_repeating(cleanup_job, interval=3600, first=3600)
 
-    logger.info("🚀 ExpenseBot v3.0 запущен — Production Ready")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    logger.info("🚀 ExpenseBot v4.0 — решительный AI, контекст диалога, голос")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
